@@ -4,6 +4,7 @@ import contextlib
 import functools
 import inspect
 import logging
+import time
 import traceback
 import types
 import warnings
@@ -95,6 +96,12 @@ class ComputationEvent:
         structural event should re-read the graph rather than trusting this set.
     :ivar states: The state of each entry in :attr:`changed_nodes` that still
         exists, as of publication. Deleted nodes are absent.
+    :ivar state_counts: How many nodes are in each state across the whole
+        computation, keyed by state name, as of publication. Every state appears,
+        so the mapping is a complete, self-contained snapshot a progress readout
+        can display without reading back into the live computation. Unlike
+        :attr:`states`, which is scoped to the nodes that just changed, this is
+        the running tally over every node.
     :ivar graph_changed: True when the structure or presentation of the graph
         changed, so any cached rendering of it is stale.
     """
@@ -103,6 +110,7 @@ class ComputationEvent:
     revision: int
     changed_nodes: frozenset[NodeKey]
     states: Mapping[NodeKey, States]
+    state_counts: Mapping[str, int]
     graph_changed: bool = False
 
 
@@ -185,6 +193,8 @@ def _notifies_subscribers(*, graph_changed: bool = False) -> Callable[[F], F]:
         def wrapped(self: "Computation", *args: Any, **kwargs: Any) -> Any:
             if self._change_depth == 0 and not self._subscriptions:
                 return method(self, *args, **kwargs)
+            if self._change_depth == 0 and self._flush_interval is not None:
+                self._last_flush = time.monotonic()
             self._change_depth += 1
             try:
                 result = method(self, *args, **kwargs)
@@ -548,11 +558,17 @@ class Computation:
         default_executor: Executor | None = None,
         executor_map: dict[str, Executor] | None = None,
         metadata: dict[str, Any] | None = None,
+        event_flush_interval: float | None = None,
     ) -> None:
         """Initialize a new Computation.
 
         :param default_executor: An executor
         :type default_executor: concurrent.futures.Executor, default ThreadPoolExecutor(max_workers=1)
+        :param event_flush_interval: When set, enables time-based batching. During a long-running operation such as
+            :meth:`compute_all`, accumulated changes are published to subscribers roughly every this many seconds
+            instead of only once the whole operation completes, so a UI can follow progress. ``None`` (the default)
+            keeps the original behaviour of one event per outermost mutation.
+        :type event_flush_interval: float or None, default None
         """
         if default_executor is None:
             self.default_executor: Executor = ThreadPoolExecutor(1)
@@ -586,6 +602,25 @@ class Computation:
         self._publishing = False
         self._pending_changed_nodes: set[NodeKey] = set()
         self._pending_graph_changed = False
+        self._flush_interval: float | None = None
+        self._last_flush: float | None = None
+        self.event_flush_interval = event_flush_interval
+
+    @property
+    def event_flush_interval(self) -> float | None:
+        """Seconds between mid-operation event flushes, or ``None`` to disable time-based batching.
+
+        See :meth:`__init__` for what enabling this does. Assigning a new value takes effect on the next operation.
+        """
+        return self._flush_interval
+
+    @event_flush_interval.setter
+    def event_flush_interval(self, value: float | None) -> None:
+        """Set the flush interval, validating that it is a positive number or ``None``."""
+        if value is not None and (not isinstance(value, (int, float)) or value <= 0):
+            msg = "event_flush_interval must be a positive number of seconds, or None to disable"
+            raise ValueError(msg)
+        self._flush_interval = None if value is None else float(value)
 
     @property
     def revision(self) -> int:
@@ -651,7 +686,31 @@ class Computation:
             for node_key in changed_nodes
             if node_key in self.dag
         }
-        return ComputationEvent(self, self._revision, changed_nodes, MappingProxyType(states), graph_changed)
+        state_counts = MappingProxyType(self._state_counts())
+        return ComputationEvent(
+            self, self._revision, changed_nodes, MappingProxyType(states), state_counts, graph_changed
+        )
+
+    def _maybe_flush(self) -> None:
+        """Publish accumulated changes mid-operation once the flush interval has elapsed.
+
+        This is the time-based batching mode. During a long-running operation such as :meth:`compute_all`,
+        subscribers otherwise see nothing until the whole operation completes, because publication happens only
+        when the outermost mutation returns. When :attr:`event_flush_interval` is set, the compute loop calls this
+        after each node so a partial event is dispatched roughly every interval seconds, letting a UI follow
+        progress. The remaining changes are still published as normal when the operation finishes.
+
+        With no interval set, or no subscribers, or nothing pending, this is a cheap no-op.
+        """
+        if self._flush_interval is None or not self._subscriptions:
+            return
+        if not self._pending_changed_nodes and not self._pending_graph_changed:
+            return
+        now = time.monotonic()
+        if self._last_flush is not None and now - self._last_flush < self._flush_interval:
+            return
+        self._last_flush = now
+        self._publish_pending_events()
 
     def _publish_pending_events(self) -> None:
         """Publish batched events, including any a subscriber triggers in turn.
@@ -723,6 +782,22 @@ class Computation:
                 return get_one_func_for_path(str(name))
 
         return AttributeView(node_func, get_one_func_for_path, get_many_func_for_path)
+
+    def _state_counts(self) -> dict[str, int]:
+        """Return how many nodes are in each state, keyed by state name.
+
+        Every member of :class:`~loman.consts.States` appears, with a count of zero where no node holds it, so
+        consumers can rely on the keys being present. The counts sum to the number of nodes in the computation.
+
+        This is the raw material for a progress or summary readout: ``ERROR`` is the failure count, and the nodes
+        still to compute are those in ``STALE`` and ``COMPUTABLE``. It is delivered to subscribers as
+        :attr:`ComputationEvent.state_counts`, computed on the mutating thread so consumers never read it back
+        across threads; this method is the one-off seed for that same tally, and is private until a public reading
+        surface is actually needed.
+
+        :return: A mapping from state name to node count, one entry per state.
+        """
+        return {state.name: len(self._state_map[state]) for state in States}
 
     def _get_names_for_state(self, state: States) -> set[Name]:
         """Get node names that have a specific state."""
@@ -1497,6 +1572,7 @@ class Computation:
                     assert tb is not None  # noqa: S101
                     self._set_error(node_key, exc, tb)
                 computed.add(node_key)
+                self._maybe_flush()
 
     def _get_calc_node_keys(self, node_key: NodeKey) -> list[NodeKey]:
         """Get node keys that need to be computed for a target node."""

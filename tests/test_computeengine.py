@@ -87,6 +87,130 @@ def test_computation_subscription_batches_public_mutations():
     assert len(events) == 1
 
 
+def _linear_chain(length: int) -> Computation:
+    """Build ``x`` plus a linear chain of ``length`` calc nodes that compute in order."""
+    comp = Computation()
+    comp.add_node("x", value=1)
+    prev = "x"
+    for i in range(length):
+        name = f"n{i}"
+        comp.add_node(name, lambda p: p + 1, kwds={"p": prev})
+        prev = name
+    return comp
+
+
+def test_event_flush_interval_defaults_to_disabled():
+    """Without an interval, compute_all still batches to a single event."""
+    comp = _linear_chain(3)
+    assert comp.event_flush_interval is None
+    events: list[ComputationEvent] = []
+    comp.subscribe(events.append)
+
+    comp.compute_all()
+
+    assert len(events) == 1
+    assert events[0].states[to_nodekey("n2")] == States.UPTODATE
+
+
+def test_event_flush_interval_emits_partial_events_during_compute():
+    """With an interval, a long compute publishes progress instead of one final event."""
+    comp = _linear_chain(3)
+    comp.event_flush_interval = 1.0
+    events: list[ComputationEvent] = []
+    comp.subscribe(events.append)
+
+    # A monotonic clock that advances 1.5s per reading: the op-start anchor plus one
+    # reading per completed node, so every node crosses the 1s interval and flushes.
+    clock = itertools.count(0.0, 1.5)
+    with patch("loman.computeengine.time.monotonic", lambda: next(clock)):
+        comp.compute_all()
+
+    assert len(events) == 3
+    assert [e.revision for e in events] == [1, 2, 3]
+    # Each node reports up to date on the flush that follows its completion.
+    assert events[0].states[to_nodekey("n0")] == States.UPTODATE
+    assert events[-1].states[to_nodekey("n2")] == States.UPTODATE
+
+
+def test_event_flush_interval_still_batches_when_interval_not_reached():
+    """A compute shorter than the interval publishes once, as if disabled."""
+    comp = _linear_chain(3)
+    comp.event_flush_interval = 10.0
+    events: list[ComputationEvent] = []
+    comp.subscribe(events.append)
+
+    clock = itertools.count(0.0, 0.1)
+    with patch("loman.computeengine.time.monotonic", lambda: next(clock)):
+        comp.compute_all()
+
+    assert len(events) == 1
+    assert events[0].states[to_nodekey("n2")] == States.UPTODATE
+
+
+def test_event_flush_interval_flushes_remainder_at_the_end():
+    """Nodes computed since the last flush are still published when the op finishes."""
+    comp = _linear_chain(3)
+    comp.event_flush_interval = 1.0
+    events: list[ComputationEvent] = []
+    comp.subscribe(events.append)
+
+    # Anchor at 0, first node at 1.5 (flushes), the rest well within the interval so
+    # they only reach subscribers via the final end-of-operation publish.
+    readings = iter([0.0, 1.5, 1.6, 1.7])
+    with patch("loman.computeengine.time.monotonic", lambda: next(readings)):
+        comp.compute_all()
+
+    assert len(events) == 2
+    assert events[1].states[to_nodekey("n2")] == States.UPTODATE
+
+
+def test_event_flush_interval_rejects_non_positive_values():
+    """The interval must be a positive number of seconds, or None."""
+    comp = Computation()
+    for bad in (0, -1, "fast"):
+        with pytest.raises(ValueError, match="positive number"):
+            comp.event_flush_interval = bad
+    comp.event_flush_interval = 0.25
+    assert comp.event_flush_interval == 0.25
+    comp.event_flush_interval = None
+    assert comp.event_flush_interval is None
+
+
+def test_event_flush_interval_can_be_set_in_constructor():
+    """The interval is accepted as a constructor argument."""
+    comp = Computation(event_flush_interval=0.5)
+    assert comp.event_flush_interval == 0.5
+
+
+def test_state_counts_seed_covers_every_state_and_sums_to_node_count():
+    """The seed snapshot names every state and its counts add up to the node count."""
+    comp = _linear_chain(3)
+    counts = comp._state_counts()
+
+    assert set(counts) == {state.name for state in States}
+    assert sum(counts.values()) == len(comp.dag)
+    # x is an up-to-date input; n0..n2 are computable/stale calc nodes.
+    assert counts[States.UPTODATE.name] == 1
+    assert counts[States.ERROR.name] == 0
+
+
+def test_event_state_counts_reflect_computation_and_failures():
+    """Each event carries a whole-computation tally that tracks results and errors."""
+    comp = Computation()
+    comp.add_node("x", value=1)
+    comp.add_node("ok", lambda x: x + 1, kwds={"x": "x"})
+    comp.add_node("boom", lambda x: 1 / 0, kwds={"x": "x"})
+    events: list[ComputationEvent] = []
+    comp.subscribe(events.append)
+    comp.compute_all()
+
+    counts = events[-1].state_counts
+    assert set(counts) == {state.name for state in States}
+    assert counts[States.ERROR.name] == 1
+    assert counts[States.UPTODATE.name] == 2
+    assert sum(counts.values()) == 3
+
+
 def test_computation_subscription_nested_mutation_emits_once():
     """Nested public mutations, such as pin calling insert, stay batched."""
     comp = Computation()
