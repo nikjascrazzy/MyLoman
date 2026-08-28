@@ -2,17 +2,26 @@
 
 import io
 import logging
+import time
 
 from loman import Computation, ConsoleProgress, States, format_progress, log_progress
 
 
 def _make_computation():
     """A three-node computation: one input and two calc nodes, one of which fails."""
-    comp = Computation()
-    comp.add_node("x", value=1)
-    comp.add_node("ok", lambda x: x + 1, kwds={"x": "x"})
-    comp.add_node("boom", lambda x: 1 / 0, kwds={"x": "x"})
+    comp = Computation(event_flush_interval=0.1)
+    comp.add_node("x", lambda: (time.sleep(2), 1)[1])
+    comp.add_node("ok", lambda x: (time.sleep(2), x + 1)[1], kwds={"x": "x"})
+    comp.add_node("boom", lambda x: (time.sleep(2), 1 / 0)[1], kwds={"x": "x"})
     return comp
+
+
+def test_visual_console_progress():
+    """The console reporter updates while a failing computation runs."""
+    comp = _make_computation()
+    #    stream = io.StringIO()
+    with ConsoleProgress(comp):
+        comp.compute_all()
 
 
 def test_format_progress_counts_done_out_of_total():

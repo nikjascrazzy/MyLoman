@@ -18,6 +18,8 @@ import logging
 import sys
 from typing import TYPE_CHECKING
 
+from tqdm import tqdm
+
 from loman.consts import States
 
 if TYPE_CHECKING:
@@ -109,17 +111,41 @@ class ConsoleProgress:
         self._stream: TextIO = sys.stderr if stream is None else stream
         self._width = 0
         self._active = False
+        df = computation.to_df()
+        self._last_work_left = len(df.loc[df["state"] != States.UPTODATE])
+        self._bar = tqdm(file=self._stream, unit="node", total=self._last_work_left)
+
         self._unsubscribe: Callable[[], None] | None = computation.subscribe(self._report)
 
     def _report(self, event: ComputationEvent) -> None:
         """Rewrite the progress line for a computation event."""
-        line = format_progress(event)
-        # Pad to the widest line seen so a shorter update does not leave stale
-        # characters from the previous, longer one behind.
-        pad = max(self._width - len(line), 0)
-        self._stream.write("\r" + line + " " * pad)
-        self._stream.flush()
-        self._width = len(line)
+        # done, total, failed = _tally(event.state_counts)
+
+        # self._bar.total= total
+        # self._bar.n = done
+
+        # if failed:
+        #     self._bar.set_postfix_str(f"{failed} failed")
+        # else:
+        #     self._bar.set_postfix_str(f"{failed} failed")
+
+        # self._bar.refresh()
+        sc_dict = {**event.state_counts}
+        sc_dict.pop("UPTODATE")
+        sc_dict.pop("ERROR")
+        sc_dict.pop("PINNED")
+        n_work_left = sum(sc_dict.values())
+
+        self._bar.update(self._last_work_left - n_work_left)
+
+        # line = format_progress(event)
+
+        # # Pad to the widest line seen so a shorter update does not leave stale
+        # # characters from the previous, longer one behind.
+        # pad = max(self._width - len(line), 0)
+        # self._stream.write("\r" + line + " " * pad)
+        # self._stream.flush()
+        # self._width = len(line)
         self._active = True
 
     def close(self) -> None:

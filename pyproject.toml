@@ -27,6 +27,7 @@ dependencies = [
     "pydotplus",
     "dill >= 0.2.5",
     "networkx >= 2.0",
+    "tqdm >= 4.70.0",
     # 2.0 is the real floor: serialization records each datetime value's
     # resolution using Timestamp.unit / DatetimeIndex.unit and restores it with
     # as_unit(), all of which arrived with non-nanosecond support in pandas 2.0.
