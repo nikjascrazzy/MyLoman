@@ -19,6 +19,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, BinaryIO, TextIO, TypeVar, cast, overload
 
 if TYPE_CHECKING:
+    from .progress import ConsoleProgress
     from .serialization.blobs import BlobStore
     from .serialization.computation import ComputationSerializer
     from .serialization.profile import SerializationProfile
@@ -2696,6 +2697,49 @@ class Computation:
             max_rendered_nodes=max_rendered_nodes,
             rankdir=rankdir,
         )
+
+    def log_progress(
+        self,
+        *,
+        logger: logging.Logger | None = None,
+        level: int = logging.INFO,
+        prefix: str = "",
+    ) -> Callable[[], None]:
+        """Log a progress line after each batched change to this computation.
+
+        Attaches a subscriber that reports the same tally the widget shows ---
+        nodes computed out of the total, and how many failed --- through Python
+        logging, for runs with no notebook attached. Set
+        :attr:`event_flush_interval` for periodic ticks during a long operation;
+        leave it unset for a single summary line when the operation completes.
+
+        :param logger: Logger to emit through; defaults to ``loman.progress``.
+        :param level: Logging level for each line.
+        :param prefix: String prepended to every line.
+        :return: An unsubscribe callable; call it to stop reporting.
+        """
+        from .progress import log_progress
+
+        return log_progress(self, logger=logger, level=level, prefix=prefix)
+
+    def console_progress(self, *, stream: Any = None) -> "ConsoleProgress":
+        """Show a single-line console progress bar for this computation.
+
+        Returns a context manager that rewrites one terminal line as work lands,
+        reporting the same tally the widget shows. Wrap the work in it::
+
+            with comp.console_progress():
+                comp.compute_all()
+
+        Pair it with :attr:`event_flush_interval` so the line advances during a
+        long operation rather than only settling at the end.
+
+        :param stream: Text stream to draw on; defaults to standard error.
+        :return: A :class:`~loman.progress.ConsoleProgress` context manager.
+        """
+        from .progress import ConsoleProgress
+
+        return ConsoleProgress(self, stream=stream)
 
     def view(self, cmap: Any = None, colors: str = "state", shapes: str | None = None) -> None:
         """Create and display a visualization of the computation graph."""

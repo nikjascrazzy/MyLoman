@@ -31,6 +31,7 @@ from loman.exception import (
 )
 from loman.nodekey import Name, Names, NodeKey, to_nodekey
 from loman.planning import ExecutionPlan, ValidationReport
+from loman.progress import ConsoleProgress, format_progress, log_progress
 from loman.serialization import ComputationSerializer, SerializationProfile
 from loman.util import BlockContext, BlockFeature, FanIn, FanOut, IdNode, InputValue, PlannedNode, Positional
 from loman.visualization import GraphView
@@ -47,6 +48,7 @@ __all__ = [
     "ComputationEvent",
     "ComputationFactory",  # Backward compatibility
     "ComputationSerializer",
+    "ConsoleProgress",
     "DeserializedError",
     "ExecutionPlan",
     "FanIn",
@@ -73,7 +75,9 @@ __all__ = [
     "block",
     "calc_node",
     "computation_factory",
+    "format_progress",
     "input_node",
+    "log_progress",
     "node",
     "repeated_blocks",
     "to_nodekey",
