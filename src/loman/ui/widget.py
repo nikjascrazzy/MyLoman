@@ -22,7 +22,7 @@ from .value import ValueWireError, apply_cell_edit, from_wire
 from .viewmodel import build_detail, node_states, state_colors
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Mapping
 
     from loman.computeengine import Computation
     from loman.visualization import GraphView
@@ -133,6 +133,13 @@ class ComputationWidget(anywidget.AnyWidget):
     detail = traitlets.Dict(default_value={}).tag(sync=True)
     status = traitlets.Unicode("").tag(sync=True)
     status_severity = traitlets.Unicode("idle").tag(sync=True)
+    #: A live count of the whole computation's nodes by state, refreshed on every
+    #: event the widget follows. Shape is ``{"total": int, "error": int,
+    #: "pending": int, "states": {state_name: count}, "revision": int}``, where
+    #: ``pending`` is the nodes still to compute (STALE plus COMPUTABLE). With an
+    #: ``event_flush_interval`` set on the computation it updates *during* a long
+    #: compute, so a summary reads as progress rather than only a final total.
+    progress = traitlets.Dict(default_value={}).tag(sync=True)
     #: Bumped after every browser request, whatever the outcome. The front end
     #: shows an optimistic busy state while it waits, and a request can
     #: legitimately change nothing else --- collapsing an already-collapsed
@@ -256,6 +263,11 @@ class ComputationWidget(anywidget.AnyWidget):
         self._canonical_status = ""
         self._canonical_severity = "idle"
         self._canonical_ack = 0
+        # Seed the progress tally once, before subscribing. From here on every
+        # update rides in on an event, so the widget never reads the live counts
+        # back out of the computation --- which a background compute thread would
+        # otherwise race.
+        self._canonical_progress = self._progress_dict(computation._state_counts(), computation.revision)
         self._canonical_full_view = ""
         # The key behind full_view. The trait must be a string to sync, and str
         # is lossy over node names, so the value is fetched by this instead.
@@ -478,6 +490,10 @@ class ComputationWidget(anywidget.AnyWidget):
             self.focus_trail = self._focus_trail()
             self.node_names = self._node_names()
             self.revision = self.computation.revision
+            # State counts only move on a computation event, which keeps
+            # _canonical_progress current; a redraw just re-renders, so it
+            # republishes the last known tally rather than reading it afresh.
+            self.progress = self._canonical_progress
             if self.selected_id:
                 selected_visible = self._id_to_visible.get(self.selected_id)
                 refreshed = None if selected_visible is None else frozenset(view.original_nodes[selected_visible])
@@ -518,14 +534,37 @@ class ComputationWidget(anywidget.AnyWidget):
         with self._own_write():
             self.detail = self._detail_for(self.selected_id)
 
+    def _progress_dict(self, counts: Mapping[str, int], revision: int) -> dict[str, Any]:
+        """Shape a state-count snapshot into the progress trait's payload.
+
+        Counts the whole computation, not the view in focus, so a scoped or
+        collapsed widget still reports the true totals. ``pending`` folds STALE
+        and COMPUTABLE together as "still to compute", which is the quantity a
+        progress readout counts down. ``counts`` comes either from the seeding
+        snapshot taken at construction or from :attr:`ComputationEvent.state_counts`
+        on a live event, so this never reads back into the computation itself.
+        """
+        return {
+            "total": sum(counts.values()),
+            "error": counts[States.ERROR.name],
+            "pending": counts[States.STALE.name] + counts[States.COMPUTABLE.name],
+            "states": dict(counts),
+            "revision": revision,
+        }
+
     def _on_computation_event(self, event: ComputationEvent) -> None:
         """Apply an automatic incremental or structural computation update."""
+        # The event carries the whole-computation tally as an immutable snapshot,
+        # so adopt it before doing anything else; both the redraw path below and
+        # the incremental path then publish the same current figures.
+        self._canonical_progress = self._progress_dict(event.state_counts, event.revision)
         if event.graph_changed or not self.repaint_states or self._view is None:
             self.refresh()
             return
         with self._own_write():
             self.node_states = node_states(self._view)
             self.revision = event.revision
+            self.progress = self._canonical_progress
         visible = self._id_to_visible.get(self.selected_id)
         if visible is not None and not set(self._view.original_nodes[visible]).isdisjoint(event.changed_nodes):
             self._refresh_detail()
@@ -572,6 +611,7 @@ class ComputationWidget(anywidget.AnyWidget):
             "focus_trail": self._focus_trail,
             "full_view": lambda: self._canonical_full_view,
             "node_names": self._node_names,
+            "progress": lambda: self._canonical_progress,
         }
         if name in view_independent:
             return view_independent[name]()
@@ -598,6 +638,7 @@ class ComputationWidget(anywidget.AnyWidget):
         "graph_svg",
         "node_names",
         "node_states",
+        "progress",
         "rankdir",
         "revision",
         "status",

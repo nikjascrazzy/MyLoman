@@ -17,12 +17,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import traitlets
 
 from loman import Computation, States
 from loman.nodekey import to_nodekey
 from loman.ui import ComputationWidget
 from loman.ui.viewmodel import MIXED_STATE_LABEL
-from loman.ui.widget import MAX_NAME_SUGGESTIONS
+from loman.ui.widget import _NO_CANONICAL, MAX_NAME_SUGGESTIONS
 from loman.visualization import GraphView
 from tests.conftest import create_example_block_computation
 
@@ -56,6 +57,40 @@ def node_id(widget: ComputationWidget, name) -> str:
     return widget._view.node_index_map[to_nodekey(name)]
 
 
+def canonical_trait_names() -> tuple[str, ...]:
+    """Every trait ``_canonical_output_changed`` guards, read from the decorator.
+
+    Deriving the set from the ``@traitlets.observe`` decorator itself, rather
+    than a hand-kept list, means a trait added to that observer is tested
+    automatically, and one that is a synced Python-owned output but never wired
+    into the observer is caught by :func:`test_every_synced_output_is_guarded`.
+    """
+    handler = ComputationWidget.__dict__["_canonical_output_changed"]
+    return handler.trait_names
+
+
+def stale_value(trait: traitlets.TraitType, expected: object) -> object:
+    """A type-valid value for ``trait`` that differs from ``expected``.
+
+    Stands in for whatever a reconnecting browser might echo back. The rules
+    cover every trait type the canonical outputs currently use; a new type
+    raises here rather than silently skipping, so the coverage cannot rot.
+    """
+    if isinstance(trait, traitlets.Bool):
+        return not expected
+    if isinstance(trait, traitlets.Int):
+        return (expected or 0) + 1
+    if isinstance(trait, traitlets.Unicode):
+        return "loman-stale" if expected != "loman-stale" else "loman-stale-2"
+    if isinstance(trait, traitlets.Dict):
+        return {"__loman_stale__": True}
+    if isinstance(trait, traitlets.List):
+        inner = getattr(trait, "_trait", None)
+        return [{"__loman_stale__": True}] if isinstance(inner, traitlets.Dict) else ["__loman_stale__"]
+    msg = f"stale_value has no rule for trait type {type(trait).__name__}; add one so coverage stays complete"
+    raise AssertionError(msg)
+
+
 class TestFollowingTheComputation:
     """The widget tracks its computation without being told to."""
 
@@ -72,6 +107,40 @@ class TestFollowingTheComputation:
             assert widget.node_states[value_id] == States.UPTODATE.name
             assert widget.graph_svg == svg
             assert widget.revision == comp.revision
+        finally:
+            widget.close()
+
+    def test_progress_summarises_the_computation_at_construction(self):
+        """The progress trait counts every node before anything is computed."""
+        comp, widget = make_widget()
+        try:
+            progress = widget.progress
+            assert progress["total"] == 3
+            assert progress["error"] == 0
+            # price and quantity are up-to-date inputs; value is still to compute.
+            assert progress["pending"] == 1
+            assert progress["states"][States.UPTODATE.name] == 2
+            assert progress["revision"] == comp.revision
+        finally:
+            widget.close()
+
+    def test_progress_follows_compute_and_reports_failures(self):
+        """The progress trait updates live as the computation runs and fails."""
+        comp = Computation()
+        comp.add_node("x", value=1)
+        comp.add_node("ok", lambda x: x + 1, kwds={"x": "x"})
+        comp.add_node("boom", lambda x: 1 / 0, kwds={"x": "x"})
+        widget = comp.widget(collapse_all=False)
+        try:
+            assert widget.progress["pending"] == 2
+
+            comp.compute_all()
+
+            progress = widget.progress
+            assert progress["pending"] == 0
+            assert progress["error"] == 1
+            assert progress["total"] == 3
+            assert progress["revision"] == comp.revision
         finally:
             widget.close()
 
@@ -659,29 +728,71 @@ class TestWidgetWithoutAGraph:
 class TestBrowserEchoes:
     """The browser model is not the source of truth."""
 
-    def test_stale_derived_traits_are_put_back(self):
-        """Reconnect echoes cannot corrupt the canonical Python-side view model."""
+    def test_every_canonical_trait_is_put_back_after_a_browser_echo(self):
+        """Reconnect echoes cannot corrupt any canonical Python-side trait.
+
+        The traits are derived from the ``@observe`` decorator, so a trait added
+        to that observer --- ``progress`` being the case that prompted this ---
+        is covered without anyone remembering to extend the test. A bare
+        assignment stands in for the browser's echo, since Python's own writes go
+        through ``_own_write`` and are exempt from the guard.
+        """
         comp, widget = make_widget()
         try:
             widget.selected_id = node_id(widget, "price")
-            expected_detail = widget.detail
-            expected_svg = widget.graph_svg
-            expected_composites = widget.composite_ids
-            expected_states = widget.node_states
+            comp.compute_all()  # give the derived traits real, non-empty values to protect
+            names = canonical_trait_names()
+            assert "progress" in names  # the trait this test was written to catch
+            traits = ComputationWidget.class_traits()
+            for name in names:
+                expected = widget._canonical_output(name)
+                if expected is _NO_CANONICAL:  # view-dependent trait with no view; nothing to protect
+                    continue
+                stale = stale_value(traits[name], expected)
+                assert stale != expected, f"stale value for {name} did not differ from canonical"
 
-            widget.composite_ids = ["stale"]
-            widget.detail = {"id": "n0", "name": "wrong node"}
-            widget.graph_svg = "<svg>stale</svg>"
-            widget.node_states = {"stale": States.ERROR.name}
-            widget.revision = -1
+                setattr(widget, name, stale)  # a bare assign reads as a browser-authored write
 
-            assert widget.composite_ids == expected_composites
-            assert widget.detail == expected_detail
-            assert widget.graph_svg == expected_svg
-            assert widget.node_states == expected_states
-            assert widget.revision == comp.revision
+                assert getattr(widget, name) == expected, f"{name} was not put back after a stale echo"
         finally:
             widget.close()
+
+    #: Synced traits the browser is allowed to write, so Python does not guard
+    #: them: the request channels and the current selection.
+    _BROWSER_WRITABLE = frozenset(
+        {
+            "edit_request",
+            "compute_request",
+            "toggle_request",
+            "layout_request",
+            "focus_request",
+            "full_view_request",
+            "graph_request",
+            "selected_id",
+        }
+    )
+    #: Synced traits Python sets once at construction and never per event. A
+    #: reconnect echoes the value Python already gave the browser, so there is
+    #: nothing to revert and no guard is needed.
+    _STATIC_CONFIG = frozenset({"buildable", "editable", "fit_on_render", "repaint_states", "state_colors"})
+
+    def test_every_synced_output_is_guarded(self):
+        """A dynamic Python-owned trait left out of the canonical observer slips through.
+
+        The derived echo test above only exercises traits already in the
+        observer, so a new output declared *without* its guard --- exactly the
+        way ``progress`` could have gone wrong --- would not be caught there. This
+        closes that gap: every synced trait must be browser-writable, static
+        config, or guarded. A new one fits none of those until someone classifies
+        it, and this fails until they do.
+        """
+        synced = {
+            name
+            for name, trait in ComputationWidget.class_own_traits().items()
+            if trait.metadata.get("sync") and not name.startswith("_")
+        }
+        unclassified = synced - self._BROWSER_WRITABLE - self._STATIC_CONFIG - set(canonical_trait_names())
+        assert unclassified == set(), f"synced traits neither guarded nor deliberately exempt: {unclassified}"
 
     def test_status_survives_a_request_carrying_a_stale_status(self):
         """The browser's cached status must not revert the one Python just set.

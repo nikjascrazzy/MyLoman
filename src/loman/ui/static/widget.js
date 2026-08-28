@@ -60,6 +60,7 @@ function render({ model, el }) {
         <button data-action="add-node" title="Define a new node in this computation">+ Node</button>
       </div>
       <span class="loman-spacer"></span>
+      <span class="loman-progress" title="Nodes computed, and failures"></span>
       <span class="loman-revision" title="Computation revision"></span>
     </div>
     <nav class="loman-breadcrumb" aria-label="Focus path" hidden></nav>
@@ -87,6 +88,7 @@ function render({ model, el }) {
   const statusText = el.querySelector(".loman-status-text");
   const legendList = el.querySelector(".loman-legend");
   const revision = el.querySelector(".loman-revision");
+  const progressReadout = el.querySelector(".loman-progress");
   const zoomLabel = el.querySelector(".loman-zoom");
   const breadcrumb = el.querySelector(".loman-breadcrumb");
   const buttons = (action) => el.querySelector(`[data-action="${action}"]`);
@@ -1339,6 +1341,27 @@ function render({ model, el }) {
     revision.textContent = value ? `rev ${value}` : "";
   };
 
+  // A compact "computed / total" readout, with failures called out when there
+  // are any. With an event_flush_interval set on the computation the progress
+  // trait updates during a long compute, so this counts up as work lands rather
+  // than only showing a final total.
+  const renderProgress = () => {
+    const progress = model.get("progress") ?? {};
+    const total = progress.total ?? 0;
+    if (!total) {
+      progressReadout.textContent = "";
+      progressReadout.dataset.severity = "idle";
+      return;
+    }
+    const pending = progress.pending ?? 0;
+    const errors = progress.error ?? 0;
+    const done = total - pending;
+    let text = `${done}/${total}`;
+    if (errors) text += ` · ${errors} failed`;
+    progressReadout.textContent = text;
+    progressReadout.dataset.severity = errors ? "error" : pending ? "busy" : "idle";
+  };
+
   const renderLayout = () => {
     const rankdir = model.get("rankdir") || "LR";
     const button = buttons("layout");
@@ -1479,6 +1502,7 @@ function render({ model, el }) {
   // the status shown falls back to whatever Python last set.
   model.on("change:ack", renderStatus);
   model.on("change:revision", renderRevision);
+  model.on("change:progress", renderProgress);
   model.on("change:editable", renderEditable);
   model.on("change:buildable", renderBuildControls);
   model.on("change:rankdir", renderLayout);
@@ -1499,6 +1523,7 @@ function render({ model, el }) {
     model.off("change:status_severity", renderStatus);
     model.off("change:ack", renderStatus);
     model.off("change:revision", renderRevision);
+    model.off("change:progress", renderProgress);
     model.off("change:editable", renderEditable);
     model.off("change:buildable", renderBuildControls);
     model.off("change:rankdir", renderLayout);
@@ -1521,6 +1546,7 @@ function render({ model, el }) {
   renderEditable();
   renderStatus();
   renderRevision();
+  renderProgress();
   renderLayout();
   renderBreadcrumb();
   // Opens at natural size rather than fitted: a large graph fitted to a notebook

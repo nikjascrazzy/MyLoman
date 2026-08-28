@@ -154,6 +154,9 @@
 }
 
 .loman-revision { color: var(--loman-ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.loman-progress { color: var(--loman-ink-3); font-size: 12px; font-variant-numeric: tabular-nums; margin-right: 10px; }
+.loman-progress[data-severity="busy"] { color: var(--loman-ink-2); }
+.loman-progress[data-severity="error"] { color: var(--loman-critical); }
 
 /* --------------------------------------------------------------- breadcrumb */
 
